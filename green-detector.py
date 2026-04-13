@@ -128,7 +128,7 @@ def main():
     plt_uv_hist.pcolor(hist_uv)
 
     (cx, cy) = (args.num_bins / 2, args.num_bins / 2)
-    a = np.radians(177)
+    a = np.radians(210)
     x = np.cos(a) * cx + cx
     y = np.sin(a) * cy + cy
 
