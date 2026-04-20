@@ -209,7 +209,16 @@ def cluster_candidates(segments, proximity=20):
         
         # Ensure valid dimensions
         if x2 > x1 and y2 > y1:
-            bboxes.append((x1, y1, x2 - x1, y2 - y1))
+            width = x2 - x1
+            height = y2 - y1
+            
+            # Filter candidates: balls are roughly square and not too elongated
+            aspect_ratio = max(width, height) / min(width, height) if min(width, height) > 0 else float('inf')
+            
+            # Keep candidates that are not too elongated (filters out field lines)
+            # Balls should have aspect ratio close to 1, lines have ratio >> 1
+            if aspect_ratio < 1.5:  
+                bboxes.append((x1, y1, width, height))
     
             
     # Convert to (x, y, w, h) format for classifiers
