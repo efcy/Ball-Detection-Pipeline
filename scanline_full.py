@@ -30,7 +30,6 @@ class CameraInfo:
 # CameraInfo.cpp getter functions translated to Python
 def make_camera_info(opening_angle_diagonal_deg: float, width=640, height=480) -> CameraInfo:
     """
-    Exact translation of CameraInfo.cpp getter functions.
     Derives focal length and vertical FOV from the diagonal FOV angle.
     """
     opening_angle_diagonal = np.radians(opening_angle_diagonal_deg)
@@ -106,8 +105,6 @@ def camera_matrix_to_world_to_cam(M: np.ndarray) -> np.ndarray:
     M_inv[:3,  3] = T_inv
     return M_inv
 
-
-
 # Camera geometry — pixel field projection
 def image_pixel_to_camera_coords(cam_info: CameraInfo, img_x: float, img_y: float) -> np.ndarray:
     """
@@ -119,8 +116,8 @@ def image_pixel_to_camera_coords(cam_info: CameraInfo, img_x: float, img_y: floa
     optical_center offsets map pixel origin (top-left) to camera center.
     """
     x = cam_info.focal_length
-    y = cam_info.optical_center_x - 0.5 - img_x   # pixel-right  → cam-left  (flip)
-    z = cam_info.optical_center_y - 0.5 - img_y   # pixel-down   → cam-up    (flip)
+    y = cam_info.optical_center_x - 0.5 - img_x    
+    z = cam_info.optical_center_y - 0.5 - img_y    
     return np.array([x, y, z])
 
 #CameraGeometry.cpp CameraGeometry::imagePixelToFieldCoord() !CHECK!
@@ -178,19 +175,18 @@ def estimated_ball_radius_px(
     Returns -1.0 if the projection is geometrically impossible.
 
     Steps:
-      1. Project pixel → field plane at height = ball_radius_mm
-         → gives horizontal ball position (x, y) on the field
+      1. Project pixel to field plane at height = ball_radius_mm, 
+        gives horizontal ball position (x, y) on the field
       2. Reconstruct full 3D ball center: (field_x, field_y, ball_radius_mm)
-         z = ball_radius because ball rests on ground → center is one radius above ground
-      3. Transform ball center into camera space → air distance from lens to ball center
-      4. Angular diameter → pixel radius:
-         alpha = atan2(r, d)   [half-angle subtended by ball]
-         pixel_r = alpha / vertical_FOV * image_height
+         z = ball_radius because ball rests on ground and center is one radius above ground
+      3. Transform ball center into camera space (air distance from lens to ball center)
+      4. Angular diameter to pixel radius
     """
     # Step 1: project pixel onto field plane at ball center height
     point_on_field = image_pixel_to_field_coord(
         cam_pose_world, cam_info, img_x, img_y, ball_radius_mm
     )
+    
     if point_on_field is None:
         return -1.0
 
@@ -217,9 +213,7 @@ def estimated_ball_radius_px(
     return alpha / cam_info.opening_angle_height * cam_info.height
 
 
-# ==============================================================================
 # Color classifier
-# ==============================================================================
 
 def angle_diff(a, b):
     return np.arctan2(np.sin(a - b), np.cos(a - b))
@@ -253,10 +247,7 @@ class ColorClassifier:
         return np.logical_and(np.logical_not(self.no_color(y, u, v)), self.is_chroma(y, u, v))
 
 
-# ==============================================================================
 # Image loading
-# ==============================================================================
-
 def load_image(path):
     img   = Image.open(path)
     ycbcr = img.convert('YCbCr')
@@ -281,10 +272,7 @@ def find_field_top_row(is_green: np.ndarray, min_green_fraction: float = 0.05) -
             return y
     return 0  # no green found, fall back to full image scan
 
-# ==============================================================================
-# Ball candidate detection — fixed step version (original)
-# ==============================================================================
-
+# Ball candidate detection — fixed step version 
 def detect_ball_candidates(image, is_green, step_y=10, step_x=10, min_gap_w=20, max_gap_w=100):
     """
     Scans the image for gaps in green field and returns candidate bounding boxes.
@@ -339,10 +327,7 @@ def detect_ball_candidates(image, is_green, step_y=10, step_x=10, min_gap_w=20, 
     return cluster_candidates(candidates), scanlines_h, scanlines_v, gap_segments
 
 
-# ==============================================================================
 # Ball candidate detection — adaptive step version (geometry-aware)
-# ==============================================================================
-
 def detect_ball_candidates_adaptive(
     image,
     is_green,
@@ -382,12 +367,12 @@ def detect_ball_candidates_adaptive(
         row_expected_radius[y] = r   # -1.0 means above horizon / invalid
 
     # --- Adaptive horizontal scanlines ---
-    # Jump by the expected ball diameter at each row so we never skip over a ball
+    # Jump by the expected ball diameter at each row so never skip over a ball
     field_top = find_field_top_row(is_green, min_green_fraction=0.05)
     for y in range(field_top, height):
         r = estimated_ball_radius_px(cam_pose_world, cam_info, ball_radius_mm, cx, y)
         row_expected_radius[y] = r
-        
+   
     scanlines_h = []
     y = field_top         
     while y < height:
@@ -416,7 +401,7 @@ def detect_ball_candidates_adaptive(
 
     min_gap = max(3,  int(r_far  * (1.0 - size_tolerance) * 2))
     max_gap = max(80, int(r_near * (1.0 + size_tolerance) * 2))
-
+    
     # --- Run the core scan using our adaptive scanlines ---
     candidates_raw, _, _, gap_segments = _scan_on_given_lines(
         image, is_green,
@@ -507,10 +492,7 @@ def _scan_on_given_lines(image, is_green, scanlines_h, scanlines_v, min_gap_w, m
     return cluster_candidates(candidates, proximity=proximity), scanlines_h, scanlines_v, gap_segments
 
 
-# ==============================================================================
 # Clustering
-# ==============================================================================
-
 def cluster_candidates(segments, proximity=15):
     """
     Groups nearby scanline segments into bounding boxes (x, y, w, h).
@@ -676,11 +658,6 @@ v_client = Vaapi(
     api_key=os.environ.get("VAT_API_TOKEN"),
 )
 
-
-# ==============================================================================
-# Main
-# ==============================================================================
-
 if __name__ == "__main__":
 
     CAMERA_INFO_TOP    = make_camera_info(opening_angle_diagonal_deg=OPENING_ANGLE_DIAGONAL_DEG)
@@ -751,8 +728,8 @@ if __name__ == "__main__":
             cam_pose_world=data["cam_pose_world"],
             cam_info=CAMERA_INFO_TOP,
             ball_radius_mm=70.0,
-            step_scale=0.5,       # one scanline per ball-radius height
-            size_tolerance=0.25,   # accept patches within ±50% of expected radius
+            step_scale=0.5,       # two scanline per ball-radius height
+            size_tolerance=0.76,   # accept patches within ±75% of expected radius
         )
 
         print(f"Frame {frame_id}: {len(candidates)} candidates after adaptive filtering")
