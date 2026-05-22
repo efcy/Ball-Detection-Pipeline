@@ -49,7 +49,7 @@ class CameraInfo:
     focal_length:         float
     optical_center_x:     float
     optical_center_y:     float
-    opening_angle_height: float
+    opening_angle_height: float  # vertical FOV in radians
 
     @staticmethod
     def from_diagonal_fov(
@@ -57,16 +57,31 @@ class CameraInfo:
         width: int = DEFAULT_IMAGE_SIZE[0],
         height: int = DEFAULT_IMAGE_SIZE[1],
     ) -> "CameraInfo":
-        diag_rad     = np.radians(opening_angle_diagonal_deg)
+        """
+        Derives focal length and vertical FOV from the diagonal FOV angle.
+        Config source: NaoTHSoccer/Config/platform/Nao6/CameraMatrixTop.ini
+        C++: getFocalLength(), getOpeningAngleHeight(), getOpticalCenterX/Y() — CameraInfo.cpp
+        """
+        opening_angle_diagonal = np.radians(opening_angle_diagonal_deg)
+
+        # getFocalLength(): half-diagonal in pixels / tan(half FOV angle)
         half_diag    = 0.5 * np.hypot(width, height)
-        focal_length = half_diag / np.tan(0.5 * diag_rad)
+        focal_length = half_diag / np.tan(0.5 * opening_angle_diagonal)
+
+        # getOpeningAngleHeight(): vertical FOV from focal length
+        opening_angle_height = 2.0 * np.arctan2(float(height), focal_length * 2.0)
+
+        # getOpticalCenterX/Y(): integer division, same as C++
+        optical_center_x = float(width  // 2)   # = 320.0
+        optical_center_y = float(height // 2)   # = 240.0
+
         return CameraInfo(
             width=width,
             height=height,
             focal_length=focal_length,
-            optical_center_x=float(width  // 2),
-            optical_center_y=float(height // 2),
-            opening_angle_height=2.0 * np.arctan2(float(height), focal_length * 2.0),
+            optical_center_x=optical_center_x,
+            optical_center_y=optical_center_y,
+            opening_angle_height=opening_angle_height,
         )
 
 
@@ -82,16 +97,29 @@ class CameraGeometry:
 
     @staticmethod
     def parse_pose_matrix(representation_data: dict) -> np.ndarray:
-        """Build a 4×4 camera-to-world matrix from an API representation dict."""
+        """
+        Parses the API representation_data into a 4x4 cam-in-world pose matrix.
+        C++: Serializer<CameraMatrix>
+
+        M = [R | T] where:
+          R  — camera axes expressed in robot/world frame (rows = x, y, z camera axes)
+          T  — camera position in robot/world frame (mm)
+
+        Usage:
+          world_point = M @ cam_point     (cam → world)
+          cam_point   = M_inv @ world_pt  (world → cam, use world_to_cam())
+        """
         pose = representation_data["pose"]
         rot  = pose["rotation"]
         t    = pose["translation"]
-        R    = np.array([
+
+        R = np.array([
             [rot[0]["x"], rot[0]["y"], rot[0]["z"]],
             [rot[1]["x"], rot[1]["y"], rot[1]["z"]],
             [rot[2]["x"], rot[2]["y"], rot[2]["z"]],
         ])
-        T = np.array([t["x"], t["y"], t["z"]])
+        T = np.array([t["x"], t["y"], t["z"]])  # camera position in world (mm)
+
         M = np.eye(4)
         M[:3, :3] = R
         M[:3,  3] = T
@@ -99,20 +127,39 @@ class CameraGeometry:
 
     @staticmethod
     def world_to_cam(cam_pose_world: np.ndarray) -> np.ndarray:
-        R     = cam_pose_world[:3, :3]
-        T     = cam_pose_world[:3,  3]
+        """
+        Inverts a cam-in-world pose into a world-to-camera transform.
+        C++: Pose3D::invert() — rigid body transform inversion
+
+        Since M is a rigid body transform (orthonormal R):
+          R_inv = R^T
+          T_inv = -R^T @ T
+        """
+        R = cam_pose_world[:3, :3]
+        T = cam_pose_world[:3,  3]
+
+        R_inv = R.T
+        T_inv = -R.T @ T
+
         M_inv = np.eye(4)
-        M_inv[:3, :3] = R.T
-        M_inv[:3,  3] = -R.T @ T
+        M_inv[:3, :3] = R_inv
+        M_inv[:3,  3] = T_inv
         return M_inv
 
     @staticmethod
     def pixel_to_cam_ray(cam_info: CameraInfo, img_x: float, img_y: float) -> np.ndarray:
-        return np.array([
-            cam_info.focal_length,
-            cam_info.optical_center_x - 0.5 - img_x,
-            cam_info.optical_center_y - 0.5 - img_y,
-        ])
+        """
+        Converts a pixel (img_x, img_y) into a direction ray in camera space.
+        C++: CameraGeometry::imagePixelToCameraCoords()
+
+        Camera convention: X = forward (optical axis), Y = left, Z = up.
+        focal_length is the X component — it sets the "depth" of the virtual image plane.
+        optical_center offsets map pixel origin (top-left) to camera center.
+        """
+        x = cam_info.focal_length
+        y = cam_info.optical_center_x - 0.5 - img_x
+        z = cam_info.optical_center_y - 0.5 - img_y
+        return np.array([x, y, z])
 
     @staticmethod
     def pixel_to_field(
@@ -123,16 +170,39 @@ class CameraGeometry:
         object_height: float = 0.0,
     ) -> np.ndarray | None:
         """
-        Project image pixel onto the horizontal field plane at *object_height* (mm).
-        Returns (field_x, field_y) or None if the ray points away from the plane.
+        Projects a pixel back onto the horizontal field plane at a given height above ground.
+        Returns (x, y) in robot/world coordinates, or None if the projection is impossible.
+        C++: CameraGeometry::imagePixelToFieldCoord()  !CHECK!
+
+        Impossible cases (mirrors the C++ epsilon guard):
+          - Ray is horizontal (pixel_vec_world[2] ≈ 0) → never reaches target height
+          - Ray points away from target height (signs differ) → looking above horizon
+            when target is below camera, or vice versa
         """
-        R, T   = cam_pose_world[:3, :3], cam_pose_world[:3, 3]
-        ray_w  = R @ CameraGeometry.pixel_to_cam_ray(cam_info, img_x, img_y)
-        dz     = object_height - T[2]
-        if ray_w[2] * dz < 1e-13:
+        epsilon = 1e-13
+
+        R = cam_pose_world[:3, :3]   # camera axes in world frame
+        T = cam_pose_world[:3,  3]   # camera position in world (mm)
+
+        # Build the ray direction: pixel → camera space → rotate into world space
+        pixel_vec_cam   = CameraGeometry.pixel_to_cam_ray(cam_info, img_x, img_y)
+        pixel_vec_world = R @ pixel_vec_cam
+
+        # Vertical gap between camera and target plane (negative when camera is above target)
+        height_diff = object_height - T[2]
+
+        # Guard: pixel_vec_world[2] is the ray's vertical component.
+        # The product must be positive: both pointing same direction toward target.
+        if pixel_vec_world[2] * height_diff < epsilon:
             return None
-        t = dz / ray_w[2]
-        return np.array([T[0] + t * ray_w[0], T[1] + t * ray_w[1]])
+
+        # Parameter t: how far along the ray to reach object_height
+        # world_point = cam_pos + t * ray_direction → solve for t from Z component
+        t = height_diff / pixel_vec_world[2]
+
+        field_x = T[0] + t * pixel_vec_world[0]
+        field_y = T[1] + t * pixel_vec_world[1]
+        return np.array([field_x, field_y])
 
     @staticmethod
     def expected_ball_radius_px(
@@ -143,20 +213,45 @@ class CameraGeometry:
         img_y: float,
     ) -> float:
         """
-        Estimate how many pixels the ball should occupy at the given image position.
-        Returns -1 if the projection is geometrically invalid.
+        Estimates the expected ball radius in pixels for a ball seen at pixel (img_x, img_y).
+        Returns -1.0 if the projection is geometrically impossible.
+        C++: CameraGeometry::estimateBallRadiusInPixels()  !CHECK!
+
+        Steps:
+          1. Project pixel to field plane at height = ball_radius_mm,
+             gives horizontal ball position (x, y) on the field
+          2. Reconstruct full 3D ball center: (field_x, field_y, ball_radius_mm)
+             z = ball_radius because ball rests on ground and center is one radius above ground
+          3. Transform ball center into camera space (air distance from lens to ball center)
+          4. Angular diameter to pixel radius
         """
-        point = CameraGeometry.pixel_to_field(
+        # Step 1: project pixel onto field plane at ball center height
+        point_on_field = CameraGeometry.pixel_to_field(
             cam_pose_world, cam_info, img_x, img_y, ball_radius_mm
         )
-        if point is None:
+
+        if point_on_field is None:
             return -1.0
-        ball_w = np.array([point[0], point[1], ball_radius_mm, 1.0])
-        ball_c = CameraGeometry.world_to_cam(cam_pose_world) @ ball_w
-        dist   = np.linalg.norm(ball_c[:3])
-        if dist <= ball_radius_mm:
+
+        # Step 2: full 3D ball center in world coordinates (homogeneous)
+        ball_center_world = np.array([
+            point_on_field[0],
+            point_on_field[1],
+            ball_radius_mm,     # z = one radius above ground
+            1.0,                # homogeneous coordinate
+        ])
+
+        # Step 3: transform into camera space, get straight-line distance
+        ball_in_cam      = CameraGeometry.world_to_cam(cam_pose_world) @ ball_center_world
+        cam_ball_distance = np.linalg.norm(ball_in_cam[:3])
+
+        # Guard: camera must be outside the ball (distance > radius)
+        # If inside, the tangent-line angular formula below breaks down
+        if cam_ball_distance <= ball_radius_mm:
             return -1.0
-        alpha = np.arctan2(ball_radius_mm, dist)
+
+        # Step 4: angular half-diameter → pixels
+        alpha = np.arctan2(ball_radius_mm, cam_ball_distance)
         return alpha / cam_info.opening_angle_height * cam_info.height
 
 
@@ -221,7 +316,7 @@ class AnnotationParser:
         if annotation.get("type") != "rectanglelabels":
             return None
 
-        value = annotation.get("value", {})
+        value  = annotation.get("value", {})
         labels = value.get("rectanglelabels", [])
 
         if not labels or labels[0].lower() != "ball":
@@ -239,7 +334,7 @@ class AnnotationParser:
         if annotation.get("type") != "polygonlabels":
             return None
 
-        value = annotation.get("value", {})
+        value  = annotation.get("value", {})
         labels = value.get("polygonlabels", [])
 
         if not labels or labels[0] != "Field Border":
@@ -256,7 +351,7 @@ class AnnotationParser:
         if annotation.get("type") != "polygonlabels":
             return []
 
-        value = annotation.get("value", {})
+        value  = annotation.get("value", {})
         labels = value.get("polygonlabels", [])
 
         if not labels or labels[0] != "Line":
@@ -267,7 +362,8 @@ class AnnotationParser:
             return []
 
         return [[(float(x), float(y)) for x, y in pts]]
-    
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Mask builder
 # ─────────────────────────────────────────────────────────────────────────────
@@ -278,7 +374,7 @@ class MaskBuilder:
     @staticmethod
     def field_border(shape: tuple, polygon: list[tuple[float, float]]) -> np.ndarray:
         """True inside the field-border polygon."""
-        h, w  = shape[:2]
+        h, w   = shape[:2]
         canvas = Image.new("L", (w, h), 0)
 
         polygon_px = [
@@ -289,7 +385,6 @@ class MaskBuilder:
         print("POLYGON PX SAMPLE:", polygon_px[:5])
 
         ImageDraw.Draw(canvas).polygon(polygon_px, fill=255)
-
         return np.array(canvas) > 0
 
     @staticmethod
@@ -299,18 +394,16 @@ class MaskBuilder:
         thickness_px: int = 8,
     ) -> np.ndarray:
         """True where annotated field lines are (rasterised with given thickness)."""
-        h, w  = shape[:2]
+        h, w   = shape[:2]
         canvas = Image.new("L", (w, h), 0)
-        draw = ImageDraw.Draw(canvas)
+        draw   = ImageDraw.Draw(canvas)
 
         for line in lines:
-
             line_px = [
                 (x / 100.0 * w, y / 100.0 * h)
                 for x, y in line
             ]
-
-            if len(line_px) >=3:
+            if len(line_px) >= 3:
                 draw.polygon(line_px, fill=255)
 
         return np.array(canvas) > 0
@@ -322,21 +415,20 @@ class MaskBuilder:
 
 @dataclass
 class DetectionResult:
-    candidates:  list[tuple[int, int, int, int]]   # (x, y, w, h) in image coords
-    scanlines_h: list[int]                          # y values of horizontal scanlines
-    scanlines_v: list[int]                          # x values of vertical scanlines
-    gap_segments: list[dict]                        # raw gap segments (for debug)
+    candidates:   list[tuple[int, int, int, int]]   # (x, y, w, h) in image coords
+    scanlines_h:  list[int]                          # y values of horizontal scanlines
+    scanlines_v:  list[int]                          # x values of vertical scanlines
+    gap_segments: list[dict]                         # raw gap segments (for debug)
 
-    green_mask: np.ndarray | None = None
-    valid_field_mask: np.ndarray | None = None
+    green_mask:        np.ndarray | None = None
+    valid_field_mask:  np.ndarray | None = None
     field_border_mask: np.ndarray | None = None
-    line_mask: np.ndarray | None = None
+    line_mask:         np.ndarray | None = None
 
-    roi: tuple[int, int, int, int] | None = None
-
+    roi:            tuple[int, int, int, int] | None = None
     raw_candidates: list[tuple[int, int, int, int]] | None = None
+    row_radius:     dict[int, float] | None = None
 
-    row_radius: dict[int, float] | None = None
 
 class BallDetector:
     """
@@ -362,35 +454,35 @@ class BallDetector:
         step_scale:     float = 0.5,
         size_tolerance: float = 0.76,
     ):
-        self.cam_pose  = cam_pose_world
-        self.cam_info  = cam_info
-        self.ball_r    = ball_radius_mm
-        self.step      = step_scale
-        self.tol       = size_tolerance
+        self.cam_pose = cam_pose_world
+        self.cam_info = cam_info
+        self.ball_r   = ball_radius_mm
+        self.step     = step_scale
+        self.tol      = size_tolerance
 
     def detect(
         self,
-        green_mask:          np.ndarray,
-        field_border_mask:   np.ndarray | None,
-        line_mask:           np.ndarray | None,
-    ): #-> DetectionResult:
+        green_mask:        np.ndarray,
+        field_border_mask: np.ndarray | None,
+        line_mask:         np.ndarray | None,
+    ) -> DetectionResult:
         h, w = green_mask.shape[:2]
 
-        # Step 1 — valid_field_mask mask: green OR (line AND inside field)
+        # Step 1 — valid_field_mask: green OR (line AND inside field)
         valid_field_mask = green_mask.copy()
         if field_border_mask is not None:
-            valid_field_mask &= field_border_mask # if something looks green, but outside the annotated field boundary - ignore it
+            valid_field_mask &= field_border_mask  # ignore green outside field boundary
         if line_mask is not None:
-            inside_lines = line_mask & (field_border_mask if field_border_mask is not None else True) # treat lines as valid_field_mask, i.e. like green
-            valid_field_mask  |= inside_lines             
+            inside_lines      = line_mask & (field_border_mask if field_border_mask is not None else True)
+            valid_field_mask |= inside_lines       # treat lines as passable (like green)
 
         # Step 2 — ROI from field border bounding box
-        roi = self._roi_from_mask(field_border_mask, w, h)
+        roi        = self._roi_from_mask(field_border_mask, w, h)
         x0, x1, y0, y1 = roi
 
         # Step 3 — expected radius per row (in full-image coords)
-        cx_full         = x0 + (x1 - x0) // 2
-        row_radius      = {
+        cx_full    = x0 + (x1 - x0) // 2
+        row_radius = {
             y: CameraGeometry.expected_ball_radius_px(
                 self.cam_pose, self.cam_info, self.ball_r, cx_full, y
             )
@@ -402,18 +494,18 @@ class BallDetector:
         scanlines_h = self._hlines(valid_field_mask, field_border_mask, row_radius, field_top_y, y0, y1, x0, x1)
         scanlines_v = self._vlines(valid_field_mask, field_border_mask, row_radius, field_top_y, y0, y1, x0, x1)
 
-        # Step 5 gap scan + clustering (working in full-image coords)
+        # Step 5 — gap scan + clustering
         radius_values = [v for v in row_radius.values() if v > 0]
-        r_far   = max(row_radius.get(scanlines_h[0]  if scanlines_h  else y0, 5.0), 3.0)
-        r_near  = max(row_radius.get(scanlines_h[-1] if scanlines_h  else y1, 60.0), r_far + 5.0)
+        r_far   = max(row_radius.get(scanlines_h[0]  if scanlines_h else y0,  5.0), 3.0)
+        r_near  = max(row_radius.get(scanlines_h[-1] if scanlines_h else y1, 60.0), r_far + 5.0)
         r_mid   = float(np.median(radius_values)) if radius_values else 15.0
         min_gap = max(3,  int(r_far  * (1 - self.tol) * 2))
         max_gap = max(80, int(r_near * (1 + self.tol) * 2))
         cluster_proximity = max(5, int(r_mid * 0.6))
 
         raw_candidates, gap_segments = self._scan_and_cluster(
-            valid_field_mask, scanlines_h, scanlines_v, min_gap, max_gap,
-            field_top_y, cluster_proximity,
+            valid_field_mask, scanlines_h, scanlines_v,
+            min_gap, max_gap, field_top_y, cluster_proximity,
         )
 
         # Step 6 — filter by expected radius; optionally split wide boxes
@@ -424,16 +516,12 @@ class BallDetector:
             scanlines_h=scanlines_h,
             scanlines_v=scanlines_v,
             gap_segments=gap_segments,
-
             green_mask=green_mask,
             valid_field_mask=valid_field_mask,
             field_border_mask=field_border_mask,
             line_mask=line_mask,
-
             roi=roi,
-
             raw_candidates=raw_candidates,
-
             row_radius=row_radius,
         )
 
@@ -460,7 +548,6 @@ class BallDetector:
         lines = []
         y = field_top
         while y < y1:
-            # Only add scanline if this row has meaningful field coverage
             row_slice = fb_mask[y, x0:x1] if fb_mask is not None else None
             if row_slice is None or row_slice.mean() > 0.05:
                 lines.append(y)
@@ -470,8 +557,8 @@ class BallDetector:
         return lines
 
     def _vlines(self, valid_field_mask, fb_mask, row_radius, field_top, y0, y1, x0, x1):
-        lines = []
-        x = x0
+        lines           = []
+        x               = x0
         representative_y = field_top + (y1 - field_top) // 2
         while x < x1:
             col_slice = fb_mask[y0:y1, x] if fb_mask is not None else None
@@ -488,9 +575,9 @@ class BallDetector:
         self, valid_field_mask, scanlines_h, scanlines_v,
         min_gap, max_gap, field_top, proximity,
     ) -> tuple[list, list]:
-        h, w       = valid_field_mask.shape[:2]
-        segments   = []
-        gap_segs   = []
+        h, w     = valid_field_mask.shape[:2]
+        segments = []
+        gap_segs = []
 
         # Horizontal gaps
         for y in scanlines_h:
@@ -584,18 +671,18 @@ class BallDetector:
             vx  = seg.get("x",  seg.get("x1", 0))  if st == "vertical"   else cluster["x1"]
             vy1 = seg.get("y1", 0)                  if st == "vertical"   else cluster["y1"]
             vy2 = seg.get("y2", vy1)                if st == "vertical"   else cluster["y2"]
-            hx1 = seg["x1"]    if st == "horizontal" else cluster["x1"]
-            hx2 = seg["x2"]    if st == "horizontal" else cluster["x2"]
-            hy1 = seg["y"]     if st == "horizontal" else cluster["y1"]
-            hy2 = seg["y"]     if st == "horizontal" else cluster["y2"]
+            hx1 = seg["x1"]  if st == "horizontal" else cluster["x1"]
+            hx2 = seg["x2"]  if st == "horizontal" else cluster["x2"]
+            hy1 = seg["y"]   if st == "horizontal" else cluster["y1"]
+            hy2 = seg["y"]   if st == "horizontal" else cluster["y2"]
 
             if ((hx1 - prox) <= vx <= (hx2 + prox)
                     and (vy1 - prox) <= hy2
                     and (vy2 + prox) >= hy1):
-                cluster["x1"] = min(cluster["x1"], hx1, vx)
-                cluster["x2"] = max(cluster["x2"], hx2, vx)
-                cluster["y1"] = min(cluster["y1"], hy1, vy1)
-                cluster["y2"] = max(cluster["y2"], hy2, vy2)
+                cluster["x1"]  = min(cluster["x1"], hx1, vx)
+                cluster["x2"]  = max(cluster["x2"], hx2, vx)
+                cluster["y1"]  = min(cluster["y1"], hy1, vy1)
+                cluster["y2"]  = max(cluster["y2"], hy2, vy2)
                 cluster["type"] = "merged"
                 return True
 
@@ -644,9 +731,9 @@ class BallDetector:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def check_annotation_match(
-    candidates:    list[tuple],
+    candidates:      list[tuple],
     ball_annotation: tuple[float, float] | None,
-    iou_threshold: float = 0.1,
+    iou_threshold:   float = 0.1,
 ) -> dict:
     """
     Returns {matched, matching_idx, best_iou, ball_in_any}.
@@ -658,10 +745,10 @@ def check_annotation_match(
         return result
 
     x, y, w, h = ball_annotation
-    bx = x + w / 2
-    by = y + h / 2
-    best_iou    = 0.0
-    best_idx    = None
+    bx      = x + w / 2
+    by      = y + h / 2
+    best_iou = 0.0
+    best_idx = None
 
     for i, (cx, cy, cw, ch) in enumerate(candidates):
         if cx <= bx <= cx + cw and cy <= by <= cy + ch:
@@ -688,180 +775,21 @@ def check_annotation_match(
 # Visualizer
 # ─────────────────────────────────────────────────────────────────────────────
 
-# class Visualizer:
-#     """
-#     Debug visualisation.
-
-#     Only content that lies *inside* the field border is drawn in detail
-#     (scanlines, gap segments, candidates).  The full image is shown as
-#     context but everything outside the field is dimmed.
-#     """
-
-#     @staticmethod
-#     def save(
-#         image:            np.ndarray,
-#         result:           DetectionResult,
-#         field_border:     list[tuple] | None = None,
-#         field_border_mask: np.ndarray | None = None,
-#         annotated_lines:  list | None = None,
-#         ball_annotation:  tuple | None = None,
-#         match_result:     dict | None = None,
-#         save_path:        Path | None = None,
-#     ) -> None:
-#         fig, ax = plt.subplots(figsize=(14, 9))
-
-#         # Dim everything outside the field so the analyst can focus inside
-#         display_image = image.copy()
-#         if field_border_mask is not None:
-#             dim_factor = 0.35
-#             outside    = ~field_border_mask
-#             display_image[outside] = (display_image[outside] * dim_factor).astype(np.uint8)
-#         ax.imshow(display_image)
-
-#         h, w = image.shape[:2]
-
-#         # ── field border outline ──────────────────────────────────────────────
-#         if field_border and len(field_border) >= 3:
-#             poly = plt.Polygon(
-#                 field_border, closed=True,
-#                 linewidth=2, edgecolor="deepskyblue", facecolor="none", alpha=0.9,
-#             )
-#             ax.add_patch(poly)
-
-#         # ── annotated field lines (white overlay) ─────────────────────────────
-#         if annotated_lines:
-#             for line in annotated_lines:
-#                 xs = [p[0] for p in line]
-#                 ys = [p[1] for p in line]
-#                 ax.plot(xs, ys, color="white", linewidth=1.5, alpha=0.7)
-
-#         # ── scanlines — only drawn where they pass through the field ─────────
-#         for y in result.scanlines_h:
-#             if field_border_mask is not None:
-#                 # Draw only the in-field segments of this scanline
-#                 row = field_border_mask[y]
-#                 segs = Visualizer._mask_to_segments(row)
-#                 for s0, s1 in segs:
-#                     ax.plot([s0, s1], [y, y], color="cyan", lw=0.9, alpha=0.55, ls="--")
-#             else:
-#                 ax.plot([0, w], [y, y], color="cyan", lw=0.9, alpha=0.55, ls="--")
-
-#         for x in result.scanlines_v:
-#             if field_border_mask is not None:
-#                 col = field_border_mask[:, x]
-#                 segs = Visualizer._mask_to_segments(col)
-#                 for s0, s1 in segs:
-#                     ax.plot([x, x], [s0, s1], color="lime", lw=0.9, alpha=0.55, ls="--")
-#             else:
-#                 ax.plot([x, x], [0, h], color="lime", lw=0.9, alpha=0.55, ls="--")
-
-#         # ── gap segments ──────────────────────────────────────────────────────
-#         for seg in result.gap_segments:
-#             if seg["type"] == "horizontal":
-#                 ax.plot(
-#                     [seg["x1"], seg["x2"]], [seg["y1"], seg["y1"]],
-#                     color="orange", lw=2.5, alpha=0.85, solid_capstyle="round",
-#                 )
-#             else:
-#                 ax.plot(
-#                     [seg["x1"], seg["x1"]], [seg["y1"], seg["y2"]],
-#                     color="yellow", lw=2.5, alpha=0.85, solid_capstyle="round",
-#                 )
-
-#         # ── candidate bounding boxes ──────────────────────────────────────────
-#         for i, (x, y, bw, bh) in enumerate(result.candidates):
-#             is_match  = match_result is not None and match_result.get("matching_idx") == i
-#             edgecolor = "#00FF00" if is_match else "#FF00FF"
-#             ax.add_patch(patches.Rectangle(
-#                 (x, y), bw, bh,
-#                 linewidth=2.5, edgecolor=edgecolor, facecolor="none",
-#             ))
-
-#         # ── annotated ball position ───────────────────────────────────────────
-#         if ball_annotation is not None:
-#             x, y, w, h = ball_annotation
-#             cx = x + w / 2
-#             cy = y + h / 2
-#             ax.add_patch(plt.Circle((cx, cy), radius=6, color="red", zorder=5))
-#             ax.plot(cx, cy, "r+", markersize=14, markeredgewidth=2, zorder=6)
-
-#         # ── title ─────────────────────────────────────────────────────────────
-#         match_str = ""
-#         if match_result is not None and ball_annotation is not None:
-#             if match_result["matched"]:
-#                 match_str = f"  ✓ MATCHED  (IoU={match_result['best_iou']:.2f})"
-#             else:
-#                 match_str = "  ✗ NOT matched"
-#         ax.set_title(
-#             f"{len(result.candidates)} candidate(s){match_str}",
-#             fontsize=12, fontweight="bold",
-#         )
-
-#         # ── legend ────────────────────────────────────────────────────────────
-#         legend = [
-#             Line2D([0], [0], color="cyan",        lw=1.5, ls="--", label="H scanlines (field only)"),
-#             Line2D([0], [0], color="lime",        lw=1.5, ls="--", label="V scanlines (field only)"),
-#             Line2D([0], [0], color="orange",      lw=2.5,          label="H gaps"),
-#             Line2D([0], [0], color="yellow",      lw=2.5,          label="V gaps"),
-#             Line2D([0], [0], marker="s", color="w", markerfacecolor="none",
-#                    markeredgecolor="#FF00FF", markersize=10, lw=0, label="Candidate"),
-#             Line2D([0], [0], marker="s", color="w", markerfacecolor="none",
-#                    markeredgecolor="#00FF00", markersize=10, lw=0, label="Matched candidate"),
-#             Line2D([0], [0], color="deepskyblue", lw=2,            label="Field border"),
-#             Line2D([0], [0], color="white",       lw=1.5,          label="Field lines"),
-#             Line2D([0], [0], marker="o", color="red", markersize=8, lw=0, label="Ball annotation"),
-#         ]
-#         ax.legend(handles=legend, loc="upper right", fontsize=9, framealpha=0.9)
-#         plt.tight_layout()
-
-#         if save_path is not None:
-#             plt.savefig(save_path, dpi=150)
-#             print(f"    Saved → {save_path}")
-#         else:
-#             plt.show()
-#         plt.close(fig)
-
-#     @staticmethod
-#     def _mask_to_segments(row_or_col: np.ndarray) -> list[tuple[int, int]]:
-#         """Convert a 1-D boolean mask into a list of (start, end) run pairs."""
-#         segs   = []
-#         inside = False
-#         start  = 0
-#         for i, val in enumerate(row_or_col):
-#             if val and not inside:
-#                 start, inside = i, True
-#             elif not val and inside:
-#                 segs.append((start, i))
-#                 inside = False
-#         if inside:
-#             segs.append((start, len(row_or_col) - 1))
-#         return segs
-
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Visualizer
-# ─────────────────────────────────────────────────────────────────────────────
-
 def debug_single(image, mask):
     h, w = image.shape[:2]
-
     fig, ax = plt.subplots(1, 2, figsize=(10, 5))
-
-    ax[0].imshow(mask.astype(np.uint8), cmap="gray",
-                 extent=[0, w, h, 0])
+    ax[0].imshow(mask.astype(np.uint8), cmap="gray", extent=[0, w, h, 0])
     ax[0].set_xlim(0, w)
     ax[0].set_ylim(h, 0)
     print("xlim:", ax[0].get_xlim(), "ylim:", ax[0].get_ylim())
     plt.show()
 
+
 def plot_mask(mask):
     mask = np.asarray(mask, dtype=np.uint8)
-
     print("shape:", mask.shape)
     print("dtype:", mask.dtype)
     print("min/max:", mask.min(), mask.max())
-
     plt.figure(figsize=(6, 5))
     plt.imshow(mask, cmap="gray", interpolation="nearest")
     plt.axis("off")
@@ -872,159 +800,93 @@ class Visualizer:
 
     @staticmethod
     def save(
-        image: np.ndarray,
-        result: DetectionResult,
+        image:            np.ndarray,
+        result:           DetectionResult,
         field_border=None,
         annotated_lines=None,
         ball_annotation=None,
         match_result=None,
         save_path=None,
     ):
-
         fig, axes = plt.subplots(2, 4, figsize=(24, 12))
         axes = axes.flatten()
 
-        # ─────────────────────────────────────────────
         # 1. RGB image
-        # ─────────────────────────────────────────────
         ax = axes[0]
         ax.imshow(image, aspect="auto", origin="upper")
         ax.set_title("1. RGB Input")
 
-        # ─────────────────────────────────────────────
         # 2. Green mask
-        # ─────────────────────────────────────────────
         ax = axes[1]
-        h, w = result.green_mask.shape
         ax.imshow(result.green_mask.astype(np.uint8) * 255,
-        cmap="gray",
-        origin="upper")
-        ax.set_aspect('auto')
+                  cmap="gray", origin="upper")
+        ax.set_aspect("auto")
         ax.set_title("2. Green Mask")
 
-        # ─────────────────────────────────────────────
         # 3. Valid field mask
-        # ─────────────────────────────────────────────
         ax = axes[2]
         h, w = result.valid_field_mask.shape
-        ax.imshow(result.valid_field_mask, cmap="gray", extent=[0, w, h, 0], aspect="auto",  origin="upper")
+        ax.imshow(result.valid_field_mask, cmap="gray",
+                  extent=[0, w, h, 0], aspect="auto", origin="upper")
         ax.set_title("3. Valid Field Mask")
 
-        # ─────────────────────────────────────────────
         # 4. ROI
-        # ─────────────────────────────────────────────
         ax = axes[3]
-        ax.imshow(image, aspect="auto",  origin="upper")
-
+        ax.imshow(image, aspect="auto", origin="upper")
         if result.roi is not None:
             x0, x1, y0, y1 = result.roi
-            ax.add_patch(
-                patches.Rectangle(
-                    (x0, y0),
-                    x1 - x0,
-                    y1 - y0,
-                    edgecolor="red",
-                    facecolor="none",
-                    linewidth=2,
-                )
-            )
-
+            ax.add_patch(patches.Rectangle(
+                (x0, y0), x1 - x0, y1 - y0,
+                edgecolor="red", facecolor="none", linewidth=2,
+            ))
         ax.set_title("4. ROI")
 
-        # ─────────────────────────────────────────────
         # 5. Scanlines
-        # ─────────────────────────────────────────────
         ax = axes[4]
-        ax.imshow(image, aspect="auto",  origin="upper")
-
+        ax.imshow(image, aspect="auto", origin="upper")
         for y in result.scanlines_h:
             ax.axhline(y, color="cyan", alpha=0.5)
-
         for x in result.scanlines_v:
             ax.axvline(x, color="lime", alpha=0.5)
-
         ax.set_title("5. Adaptive Scanlines")
 
-        # ─────────────────────────────────────────────
         # 6. Gap segments
-        # ─────────────────────────────────────────────
         ax = axes[5]
-        ax.imshow(image, aspect="auto",  origin="upper")
-
+        ax.imshow(image, aspect="auto", origin="upper")
         for seg in result.gap_segments:
             if seg["type"] == "horizontal":
-                ax.plot(
-                    [seg["x1"], seg["x2"]],
-                    [seg["y1"], seg["y1"]],
-                    color="orange",
-                    linewidth=3,
-                )
+                ax.plot([seg["x1"], seg["x2"]], [seg["y1"], seg["y1"]],
+                        color="orange", linewidth=3)
             else:
-                ax.plot(
-                    [seg["x1"], seg["x1"]],
-                    [seg["y1"], seg["y2"]],
-                    color="yellow",
-                    linewidth=3,
-                )
-
+                ax.plot([seg["x1"], seg["x1"]], [seg["y1"], seg["y2"]],
+                        color="yellow", linewidth=3)
         ax.set_title("6. Gap Segments")
 
-        # ─────────────────────────────────────────────
         # 7. Raw clustered candidates
-        # ─────────────────────────────────────────────
         ax = axes[6]
-        ax.imshow(image, aspect="auto",  origin="upper")
-
+        ax.imshow(image, aspect="auto", origin="upper")
         if result.raw_candidates is not None:
             for x, y, w, h in result.raw_candidates:
-                ax.add_patch(
-                    patches.Rectangle(
-                        (x, y),
-                        w,
-                        h,
-                        edgecolor="magenta",
-                        facecolor="none",
-                        linewidth=2,
-                    )
-                )
-
+                ax.add_patch(patches.Rectangle(
+                    (x, y), w, h,
+                    edgecolor="magenta", facecolor="none", linewidth=2,
+                ))
         ax.set_title("7. Raw Clusters")
 
-        # ─────────────────────────────────────────────
         # 8. Final filtered candidates
-        # ─────────────────────────────────────────────
         ax = axes[7]
-        ax.imshow(image, aspect="auto",  origin="upper")
-
+        ax.imshow(image, aspect="auto", origin="upper")
         for i, (x, y, w, h) in enumerate(result.candidates):
-
-            is_match = (
-                match_result is not None
-                and match_result.get("matching_idx") == i
-            )
-
-            color = "lime" if is_match else "red"
-
-            ax.add_patch(
-                patches.Rectangle(
-                    (x, y),
-                    w,
-                    h,
-                    edgecolor=color,
-                    facecolor="none",
-                    linewidth=3,
-                )
-            )
-
+            is_match  = match_result is not None and match_result.get("matching_idx") == i
+            ax.add_patch(patches.Rectangle(
+                (x, y), w, h,
+                edgecolor="lime" if is_match else "red",
+                facecolor="none", linewidth=3,
+            ))
         if ball_annotation is not None:
             x, y, w, h = ball_annotation
-            cx = x + w / 2
-            cy = y + h / 2
-            ax.plot(cx, cy, "b+", markersize=15)
-
+            ax.plot(x + w / 2, y + h / 2, "b+", markersize=15)
         ax.set_title("8. Final Detection")
-
-        # ─────────────────────────────────────────────
 
         for ax in axes:
             ax.set_xticks([])
@@ -1039,28 +901,28 @@ class Visualizer:
 
         plt.close(fig)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Image I/O
+# ─────────────────────────────────────────────────────────────────────────────
 
 def load_image_ycbcr(path: Path):
-    img = Image.open(path)
-
+    img   = Image.open(path)
     print("RAW PIL size:", img.size)
 
     ycbcr = img.convert("YCbCr")
-    arr = np.array(ycbcr)
-
+    arr   = np.array(ycbcr)
     print("YCbCr array:", arr.shape)
 
     rgb = np.array(img.convert("RGB"))
-
     print("RGB array:", rgb.shape)
 
     return rgb, arr[..., 0], arr[..., 1], arr[..., 2]
 
+
 def load_annotation(path: Path) -> dict:
     with open(path) as f:
-        data = json.load(f)
-    return data
+        return json.load(f)
 
 
 def scan_folder(folder: Path, image_ext: str = ".jpg") -> list[dict]:
@@ -1071,11 +933,10 @@ def scan_folder(folder: Path, image_ext: str = ".jpg") -> list[dict]:
     entries = []
     for img_path in sorted(folder.glob(f"*{image_ext}")):
         json_path = img_path.with_suffix(".json")
-        
         if not json_path.exists():
             print(f"  [skip] no JSON for {img_path.name}")
             continue
-        parts        = img_path.stem.split("_", 1)
+        parts = img_path.stem.split("_", 1)
         entries.append(dict(
             stem       = img_path.stem,
             image_path = img_path,
@@ -1087,17 +948,20 @@ def scan_folder(folder: Path, image_ext: str = ".jpg") -> list[dict]:
     return entries
 
 
-# Frame processor — orchestrates one frame end-to-end
+# ─────────────────────────────────────────────────────────────────────────────
+# Frame processor
+# ─────────────────────────────────────────────────────────────────────────────
+
 class FrameProcessor:
     def __init__(
         self,
-        cam_info:    CameraInfo,
-        classifier:  ColorClassifier,
+        cam_info:   CameraInfo,
+        classifier: ColorClassifier,
         v_client,
-        camera:      str = "TOP",
-        vis_dir:     Path = Path("./visualizations"),
-        step_scale:  float = 0.5,
-        size_tol:    float = 0.76,
+        camera:     str  = "TOP",
+        vis_dir:    Path = Path("./visualizations"),
+        step_scale: float = 0.5,
+        size_tol:   float = 0.76,
     ):
         self.cam_info   = cam_info
         self.classifier = classifier
@@ -1125,8 +989,7 @@ class FrameProcessor:
         # Load annotation
         try:
             annotation_data = load_annotation(entry["json_path"])
-            annotations = annotation_data
-          
+            annotations     = annotation_data
         except (ValueError, json.JSONDecodeError) as e:
             print(f"  [skip] annotation error: {e}")
             return False
@@ -1145,9 +1008,9 @@ class FrameProcessor:
         if isinstance(annotations, dict) and "annotations" in annotations:
             annotations = annotations["annotations"][0]["result"]
 
-        ball_ann = None
+        ball_ann     = None
         field_border = None
-        lines = []
+        lines        = []
 
         for ann in annotations:
             b = AnnotationParser.ball(ann)
@@ -1163,10 +1026,11 @@ class FrameProcessor:
             ls = AnnotationParser.lines(ann)
             if ls:
                 lines.extend(ls)
-                print(f"  Found {len(ls)} annotated line(s) with total {sum(len(l) for l in ls)} points")
-                
+                print(f"  Found {len(ls)} annotated line(s) with total "
+                      f"{sum(len(l) for l in ls)} points")
+
         # Build pixel masks
-        shape = img_rgb.shape
+        shape     = img_rgb.shape
         fb_mask   = MaskBuilder.field_border(shape, field_border) if field_border else None
         line_mask = MaskBuilder.lines(shape, lines)               if lines        else None
 
@@ -1191,19 +1055,7 @@ class FrameProcessor:
         else:
             print("  No ball annotated")
 
-      
         # Visualise
-
-        # debug_single(img_rgb, result.valid_field_mask)
-        # #plot_mask(result.valid_field_mask)
-        # # print("BEFORE SAVE:")
-        # # print(result.valid_field_mask.shape)
-        # # print(result.valid_field_mask.dtype)
-        # # print(result.valid_field_mask.flags["C_CONTIGUOUS"])
-        # # mask = np.ascontiguousarray(result.valid_field_mask.copy())
-        # # mask_u8 = (mask.astype(np.uint8) * 255)
-        # # plt.imsave("mask_debug.png",mask_u8, cmap="gray")
-
         Visualizer.save(
             img_rgb,
             result,
