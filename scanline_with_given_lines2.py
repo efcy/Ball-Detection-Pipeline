@@ -194,8 +194,8 @@ class CameraGeometry:
         # Guard: pixel_vec_world[2] is the ray's vertical component.
         # The product must be positive: both pointing same direction toward target.
         if pixel_vec_world[2] * height_diff < epsilon:
-            return None
-
+           return None
+        
         # Parameter t: how far along the ray to reach object_height
         # world_point = cam_pos + t * ray_direction → solve for t from Z component
         t = height_diff / pixel_vec_world[2]
@@ -491,6 +491,7 @@ class BallDetector:
 
         # Step 4 — adaptive scanlines (full-image coords, inside ROI)
         field_top_y = self._first_green_row(valid_field_mask[y0:y1, x0:x1], y0)
+        
         scanlines_h = self._hlines(valid_field_mask, field_border_mask, row_radius, field_top_y, y0, y1, x0, x1)
         scanlines_v = self._vlines(valid_field_mask, field_border_mask, row_radius, field_top_y, y0, y1, x0, x1)
 
@@ -547,19 +548,27 @@ class BallDetector:
     def _hlines(self, valid_field_mask, fb_mask, row_radius, field_top, y0, y1, x0, x1):
         lines = []
         y = field_top
+        last_valid_r = 10.0
         while y < y1:
             row_slice = fb_mask[y, x0:x1] if fb_mask is not None else None
             if row_slice is None or row_slice.mean() > 0.05:
                 lines.append(y)
             r    = row_radius.get(y, -1.0)
-            step = max(2, int(self.step * 2 * r)) if r > 0 else 10
-            y   += step
+            
+            if r <= 0:
+                r = last_valid_r
+            else:
+                last_valid_r = r
+
+            step = max(2, int(self.step * 2 * r))
+            y += step
         return lines
 
     def _vlines(self, valid_field_mask, fb_mask, row_radius, field_top, y0, y1, x0, x1):
         lines           = []
         x               = x0
         representative_y = field_top + (y1 - field_top) // 2
+        last_valid_r = 5
         while x < x1:
             col_slice = fb_mask[y0:y1, x] if fb_mask is not None else None
             if col_slice is None or col_slice.mean() > 0.05:
@@ -567,7 +576,13 @@ class BallDetector:
             r    = CameraGeometry.expected_ball_radius_px(
                 self.cam_pose, self.cam_info, self.ball_r, x, representative_y
             )
-            step = max(2, int(self.step * 2 * r)) if r > 0 else 10
+            
+            if r <= 0:
+                r = last_valid_r
+                print(f"Warning: invalid radius at x={x}, using last valid r={r:.2f}")
+            else:
+                last_valid_r = r
+            step = max(2, int(self.step * 2 * r))
             x   += step
         return lines
 
