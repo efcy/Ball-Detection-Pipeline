@@ -2,7 +2,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from PIL import Image
 import matplotlib.patches as patches
-
+from pathlib import Path
 
 # calculate th difference between angles a and b
 def angle_diff(a, b):
@@ -125,6 +125,7 @@ def cluster_candidates(segments, proximity=20):
         matched = False
         
         for cluster in clusters:
+
             # Check for overlap between segments
             if seg['type'] == 'horizontal' and cluster.get('type') == 'horizontal':
 
@@ -217,7 +218,7 @@ def cluster_candidates(segments, proximity=20):
             
             # Keep candidates that are not too elongated (filters out field lines)
             # Balls should have aspect ratio close to 1, lines have ratio >> 1
-            if aspect_ratio < 1.5:  
+            if aspect_ratio < 5:  
                 bboxes.append((x1, y1, width, height))
     
             
@@ -237,8 +238,6 @@ def visualize_candidates(image, candidate_bboxes):
     ax.imshow(image)
 
     for (x, y, w, h) in candidate_bboxes:
-        # Create a Rectangle patch
-        # We use a bright color (like magenta or cyan) to stand out against green
         rect = patches.Rectangle(
             (x, y), w, h, 
             linewidth=2, 
@@ -247,7 +246,6 @@ def visualize_candidates(image, candidate_bboxes):
         )
         ax.add_patch(rect)
         
-        # Optional: Add a label
         ax.text(x, y - 5, 'Candidate', color='#FF00FF', fontsize=8, weight='bold')
 
     plt.title(f"Detected {len(candidate_bboxes)} Potential Ball Regions")
@@ -258,14 +256,17 @@ def visualize_candidates(image, candidate_bboxes):
 # def my_green_classifier(pixel): ... return True/False
 # candidates = detect_ball_candidates(frame, my_green_classifier)
 if __name__ == "__main__":
-    (img, img_y, img_u, img_v) = load_image("example_frame_rc25.png")
+    # Images from Labor C:\Users\anina\Documents\Studium_Berlin\Study\RoboCup2026\naoth-deeplearning\balldetection2026\patch_based_training\data\TOP\images\
+    for path in Path("test_images").iterdir():
+        if path.is_file():
+            (img, img_y, img_u, img_v) = load_image(path)
 
-    classifier_green = ColorClassifier(55, 10, 40, np.radians(210), np.radians(25))  # green
-    img_green = classifier_green.is_color(img_y, img_u, img_v)
+            classifier_green = ColorClassifier(55, 10, 40, np.radians(210), np.radians(25))  # green
+            img_green = classifier_green.is_color(img_y, img_u, img_v)
 
-    #print(img_green[0,0])
+            #print(img_green[0,0])
 
-    candidates = detect_ball_candidates(np.array(img), img_green)
-    print(candidates)
+            candidates = detect_ball_candidates(np.array(img), img_green)
+            print(candidates)
 
-    visualize_candidates(np.array(img), candidates)
+            visualize_candidates(np.array(img), candidates)

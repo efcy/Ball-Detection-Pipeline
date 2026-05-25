@@ -335,7 +335,7 @@ def detect_ball_candidates_adaptive(
     cam_info: CameraInfo,
     ball_radius_mm: float = BALL_RADIUS,
     step_scale: float = 0.35,        # scanline step = step_scale × expected ball diameter
-    size_tolerance: float = 0.5,    # accept patches within ±50% of expected radius
+    size_tolerance: float = 0.75,    # accept patches within ±50% of expected radius
 ):
     """
     Geometry-aware version: scanline density and patch filtering both adapt to
@@ -664,13 +664,8 @@ if __name__ == "__main__":
     CAMERA_INFO_BOTTOM = make_camera_info(opening_angle_diagonal_deg=OPENING_ANGLE_DIAGONAL_DEG)
 
     cam = CAMERA_INFO_TOP
-    # print(f"focal_length:         {cam.focal_length:.4f} px")
-    # print(f"opening_angle_height: {np.degrees(cam.opening_angle_height):.4f} deg")
-    # print(f"optical_center:       {cam.optical_center_x}, {cam.optical_center_y}")
-
-    # ------------------------------------------------------------------
     # Fetch images + camera matrices
-    # ------------------------------------------------------------------
+
     frame_data    = {}
     image_obj_list = v_client.image.list(log=log_id, camera=camera)
     first_batch   = list(islice(image_obj_list, 10))

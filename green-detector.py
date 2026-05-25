@@ -19,6 +19,8 @@ class ColorClassifier:
         self.brightnessConeOffset = bO  # 20
         self.colorAngleCenter = cC  # -1.25 # yellow
         self.colorAngleWith = cW  # 0.1
+        # Brightness parameters define what counts as “low chroma” (gray/white/black)
+        # Color parameters define a sector in UV space corresponding to a specific color (e.g., green)
 
     # return true if the (y,u,v) have a low color part, i.e., white, gray, black
     def no_color(self, y, u, v):
