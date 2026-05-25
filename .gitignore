@@ -1,0 +1,11 @@
+# Ignore all image files
+*.png
+*.jpg
+*.jpeg
+
+# Ignore all JSON files
+*.json
+
+# Ignore an entire folder
+visualizations/
+test_images/
