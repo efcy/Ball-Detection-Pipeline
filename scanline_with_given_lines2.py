@@ -259,51 +259,101 @@ class CameraGeometry:
 # Color classifier
 # ─────────────────────────────────────────────────────────────────────────────
 
+# class ColorClassifier:
+#     """
+#     YCbCr-based colour classifier.  Construct with tuned parameters; call
+#     is_green() on numpy arrays of Y / Cb / Cr channel values.
+#     """
+
+#     def __init__(
+#         self,
+#         brightness_cone_radius_white: float,
+#         brightness_cone_radius_black: float,
+#         brightness_cone_offset:       float,
+#         color_angle_center:           float,
+#         color_angle_width:            float,
+#     ):
+#         self.bcr_white  = brightness_cone_radius_white
+#         self.bcr_black  = brightness_cone_radius_black
+#         self.bc_offset  = brightness_cone_offset
+#         self.ca_center  = color_angle_center
+#         self.ca_width   = color_angle_width
+
+#     # ── private helpers ───────────────────────────────────────────────────────
+
+#     def _is_achromatic(self, y: np.ndarray, u: np.ndarray, v: np.ndarray) -> np.ndarray:
+#         alpha     = (self.bcr_white - self.bcr_black) / (255.0 - self.bc_offset)
+#         threshold = np.clip(
+#             self.bcr_black + alpha * (y - self.bc_offset),
+#             self.bcr_black, 255,
+#         )
+#         return np.hypot(u - 128, v - 128) < threshold
+
+#     def _is_target_hue(self, u: np.ndarray, v: np.ndarray) -> np.ndarray:
+#         angle = np.arctan2(v - 128, u - 128)
+#         diff  = np.arctan2(np.sin(angle - self.ca_center), np.cos(angle - self.ca_center))
+#         return np.abs(diff) < self.ca_width
+
+#     # ── public ───────────────────────────────────────────────────────────────
+
+#     def is_green(self, y: np.ndarray, u: np.ndarray, v: np.ndarray) -> np.ndarray:
+#         return ~self._is_achromatic(y, u, v) & self._is_target_hue(u, v)
+
+#     @staticmethod
+#     def default_green() -> "ColorClassifier":
+#         return ColorClassifier(50, 3, 40, np.radians(-132.0), np.radians(34.9))
+
+def angle_diff(a, b):
+    return np.arctan2(np.sin(a - b), np.cos(a - b))
 class ColorClassifier:
-    """
-    YCbCr-based colour classifier.  Construct with tuned parameters; call
-    is_green() on numpy arrays of Y / Cb / Cr channel values.
-    """
+    def __init__(self, bW, bB, bO, cC, cW):
+        self.brightnessConeRadiusWhite = bW
+        self.brightnessConeRadiusBlack = bB
+        self.brightnessConeOffset = bO
+        self.colorAngleCenter = cC
+        self.colorAngleWidth = cW  
+        # Brightness parameters define what counts as “low chroma” (gray/white/black)
+        # Color parameters define a sector in UV space corresponding to a specific color (e.g., green)
+        
+    def no_color(self, y, u, v):
+        brightness_alpha = (self.brightnessConeRadiusWhite - self.brightnessConeRadiusBlack) / (
+                    255.0 - self.brightnessConeOffset)
+        chroma_threshold = np.clip(
+            self.brightnessConeRadiusBlack + brightness_alpha * (y - self.brightnessConeOffset),
+            self.brightnessConeRadiusBlack, 255)
+        chroma = np.hypot(u - 128, v - 128)
+        return np.less(chroma, chroma_threshold)
 
-    def __init__(
-        self,
-        brightness_cone_radius_white: float,
-        brightness_cone_radius_black: float,
-        brightness_cone_offset:       float,
-        color_angle_center:           float,
-        color_angle_width:            float,
-    ):
-        self.bcr_white  = brightness_cone_radius_white
-        self.bcr_black  = brightness_cone_radius_black
-        self.bc_offset  = brightness_cone_offset
-        self.ca_center  = color_angle_center
-        self.ca_width   = color_angle_width
 
-    # ── private helpers ───────────────────────────────────────────────────────
+    def is_chroma(self, y, u, v):
+        color_angle = np.arctan2(v - 128, u - 128)
+        diff = angle_diff(color_angle, self.colorAngleCenter)
+        return np.abs(diff) < self.colorAngleWidth
 
-    def _is_achromatic(self, y: np.ndarray, u: np.ndarray, v: np.ndarray) -> np.ndarray:
-        alpha     = (self.bcr_white - self.bcr_black) / (255.0 - self.bc_offset)
-        threshold = np.clip(
-            self.bcr_black + alpha * (y - self.bc_offset),
-            self.bcr_black, 255,
-        )
-        return np.hypot(u - 128, v - 128) < threshold
 
-    def _is_target_hue(self, u: np.ndarray, v: np.ndarray) -> np.ndarray:
-        angle = np.arctan2(v - 128, u - 128)
-        diff  = np.arctan2(np.sin(angle - self.ca_center), np.cos(angle - self.ca_center))
-        return np.abs(diff) < self.ca_width
+    def is_color(self, y, u, v):
+        # print("no_color:", self.no_color(y, u, v))
+        # print("is_chroma:", self.is_chroma(y, u, v))
+        return np.logical_and(np.logical_not(self.no_color(y, u, v)), self.is_chroma(y, u, v))
 
-    # ── public ───────────────────────────────────────────────────────────────
 
-    def is_green(self, y: np.ndarray, u: np.ndarray, v: np.ndarray) -> np.ndarray:
-        return ~self._is_achromatic(y, u, v) & self._is_target_hue(u, v)
+    def classify(self, y, u, v):
+        mask = self.is_color(y, u, v)
+        print("no_color ratio:", self.no_color(y, u, v).mean())
+        print("chroma ratio:", self.is_chroma(y, u, v).mean())
+        print("final green ratio:", mask.mean())
+        return mask
 
     @staticmethod
-    def default_green() -> "ColorClassifier":
-        return ColorClassifier(50, 3, 40, np.radians(-132.0), np.radians(34.9))
-
-
+    def default_green():
+        return ColorClassifier(
+            bW=50,
+            bB=10,
+            bO=20,
+            cC=np.radians(-130),
+            cW=np.radians(30),
+        )
+        #ColorClassifier(49, 11, 20, np.radians(-130.7), np.radians(31.7))  ←  center=-130.7°  width=±31.7°
 # ─────────────────────────────────────────────────────────────────────────────
 # Annotation parser
 # ─────────────────────────────────────────────────────────────────────────────
@@ -564,26 +614,53 @@ class BallDetector:
             y += step
         return lines
 
-    def _vlines(self, valid_field_mask, fb_mask, row_radius, field_top, y0, y1, x0, x1):
-        lines           = []
-        x               = x0
-        representative_y = field_top + (y1 - field_top) // 2
-        last_valid_r = 5
-        while x < x1:
-            col_slice = fb_mask[y0:y1, x] if fb_mask is not None else None
-            if col_slice is None or col_slice.mean() > 0.05:
-                lines.append(x)
-            r    = CameraGeometry.expected_ball_radius_px(
-                self.cam_pose, self.cam_info, self.ball_r, x, representative_y
-            )
+    # def _vlines(self, valid_field_mask, fb_mask, row_radius, field_top, y0, y1, x0, x1):
+    #     lines           = []
+    #     x               = x0
+    #     representative_y = field_top + (y1 - field_top) // 2
+    #     last_valid_r = 5
+    #     while x < x1:
+    #         col_slice = fb_mask[y0:y1, x] if fb_mask is not None else None
+    #         if col_slice is None or col_slice.mean() > 0.05:
+    #             lines.append(x)
+    #         r    = CameraGeometry.expected_ball_radius_px(
+    #             self.cam_pose, self.cam_info, self.ball_r, x, representative_y
+    #         )
             
-            if r <= 0:
-                r = last_valid_r
-                print(f"Warning: invalid radius at x={x}, using last valid r={r:.2f}")
-            else:
-                last_valid_r = r
-            step = max(2, int(self.step * 2 * r))
-            x   += step
+    #         if r <= 0:
+    #             r = last_valid_r
+    #             print(f"Warning: invalid radius at x={x}, using last valid r={r:.2f}")
+    #         else:
+    #             last_valid_r = r
+    #         step = max(2, int(self.step * 2 * r))
+    #         x   += step
+    #     return lines
+
+    def _vlines(
+        self,
+        valid_field_mask,
+        fb_mask,
+        row_radius,
+        field_top,
+        y0,
+        y1,
+        x0,
+        x1,
+        spacing: int = 8,
+    ):
+        """
+        Generate vertically oriented scanlines with constant spacing.
+
+        Parameters
+        ----------
+        spacing : int
+            Horizontal pixel distance between neighbouring vertical scanlines.
+        """
+        lines = []
+
+        for x in range(x0, x1, spacing):
+            lines.append(x)
+
         return lines
 
     def _scan_and_cluster(
@@ -833,8 +910,7 @@ class Visualizer:
 
         # 2. Green mask
         ax = axes[1]
-        ax.imshow(result.green_mask.astype(np.uint8) * 255,
-                  cmap="gray", origin="upper")
+        ax.imshow(result.green_mask, origin="upper")
         ax.set_aspect("auto")
         ax.set_title("2. Green Mask")
 
@@ -923,16 +999,25 @@ class Visualizer:
 
 def load_image_ycbcr(path: Path):
     img   = Image.open(path)
-    print("RAW PIL size:", img.size)
 
     ycbcr = img.convert("YCbCr")
-    arr   = np.array(ycbcr)
-    print("YCbCr array:", arr.shape)
+    width = ycbcr.size[0]
+    height = ycbcr.size[1]
+    size = (height, width)
+
+    # separate channels
+    img_y = np.array(list(ycbcr.getdata(band=0)))
+    img_u = np.array(list(ycbcr.getdata(band=1)))
+    img_v = np.array(list(ycbcr.getdata(band=2)))
+
+    img_y = np.reshape(img_y, size)
+    img_u = np.reshape(img_u, size)
+    img_v = np.reshape(img_v, size)
 
     rgb = np.array(img.convert("RGB"))
     print("RGB array:", rgb.shape)
 
-    return rgb, arr[..., 0], arr[..., 1], arr[..., 2]
+    return rgb, img_y, img_u, img_v
 
 
 def load_annotation(path: Path) -> dict:
@@ -1016,9 +1101,14 @@ class FrameProcessor:
             return False
 
         # Load image + compute green mask
-        img_rgb, img_y, img_cb, img_cr = load_image_ycbcr(entry["image_path"])
-        green_mask = self.classifier.is_green(img_y, img_cb, img_cr)
-
+        img_rgb, img_y, img_u, img_v = load_image_ycbcr(entry["image_path"])
+      
+        green_mask = self.classifier.is_color(
+            img_y,
+            img_u,
+            img_v,
+        )
+       
         # If Label Studio format
         if isinstance(annotations, dict) and "annotations" in annotations:
             annotations = annotations["annotations"][0]["result"]
