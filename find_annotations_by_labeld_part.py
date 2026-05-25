@@ -164,7 +164,7 @@ if __name__ == "__main__":
                 )
 
                 img_path = OUTPUT_DIR / f"{numeric_log_id}_{frame_id}.jpg"
-                ann_path = OUTPUT_DIR / f"{numeric_log_id}_{frame_id}_annotation.json"
+                ann_path = OUTPUT_DIR / f"{numeric_log_id}_{frame_id}.json"
 
                 success = download_image(img_url, img_path)
 
