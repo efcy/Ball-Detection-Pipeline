@@ -60,7 +60,7 @@ class CameraInfo:
         """
         Derives focal length and vertical FOV from the diagonal FOV angle.
         Config source: NaoTHSoccer/Config/platform/Nao6/CameraMatrixTop.ini
-        C++: getFocalLength(), getOpeningAngleHeight(), getOpticalCenterX/Y() — CameraInfo.cpp
+        C++: CameraInfo.cpp getter functions translated to Python
         """
         opening_angle_diagonal = np.radians(opening_angle_diagonal_deg)
 
@@ -71,7 +71,7 @@ class CameraInfo:
         # getOpeningAngleHeight(): vertical FOV from focal length
         opening_angle_height = 2.0 * np.arctan2(float(height), focal_length * 2.0)
 
-        # getOpticalCenterX/Y(): integer division, same as C++
+        # getOpticalCenterX/Y(): integer division
         optical_center_x = float(width  // 2)   # = 320.0
         optical_center_y = float(height // 2)   # = 240.0
 
@@ -84,41 +84,29 @@ class CameraInfo:
             opening_angle_height=opening_angle_height,
         )
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Camera geometry
-# ─────────────────────────────────────────────────────────────────────────────
-
 class CameraGeometry:
     """
-    All methods are stateless; pass cam_pose_world (4×4 camera-to-world matrix)
-    and a CameraInfo explicitly.
+    NaoTH-consistent camera geometry layer.
+    Conventions (aligned with RoboCup NaoTH):
+    - Camera coordinate system:
+        X: forward (optical axis)
+        Y: left
+        Z: up
     """
 
     @staticmethod
-    def parse_pose_matrix(representation_data: dict) -> np.ndarray:
-        """
-        Parses the API representation_data into a 4x4 cam-in-world pose matrix.
-        C++: Serializer<CameraMatrix>
-
-        M = [R | T] where:
-          R  — camera axes expressed in robot/world frame (rows = x, y, z camera axes)
-          T  — camera position in robot/world frame (mm)
-
-        Usage:
-          world_point = M @ cam_point     (cam → world)
-          cam_point   = M_inv @ world_pt  (world → cam, use world_to_cam())
-        """
-        pose = representation_data["pose"]
-        rot  = pose["rotation"]
-        t    = pose["translation"]
+    def parse_into_pose_matrix(rep: dict) -> np.ndarray:
+        pose = rep["pose"]
+        rot = pose["rotation"]
+        t   = pose["translation"]
 
         R = np.array([
             [rot[0]["x"], rot[0]["y"], rot[0]["z"]],
             [rot[1]["x"], rot[1]["y"], rot[1]["z"]],
             [rot[2]["x"], rot[2]["y"], rot[2]["z"]],
-        ])
-        T = np.array([t["x"], t["y"], t["z"]])  # camera position in world (mm)
+        ], dtype=float)
+
+        T = np.array([t["x"], t["y"], t["z"]], dtype=float)
 
         M = np.eye(4)
         M[:3, :3] = R
@@ -126,17 +114,9 @@ class CameraGeometry:
         return M
 
     @staticmethod
-    def world_to_cam(cam_pose_world: np.ndarray) -> np.ndarray:
-        """
-        Inverts a cam-in-world pose into a world-to-camera transform.
-        C++: Pose3D::invert() — rigid body transform inversion
-
-        Since M is a rigid body transform (orthonormal R):
-          R_inv = R^T
-          T_inv = -R^T @ T
-        """
-        R = cam_pose_world[:3, :3]
-        T = cam_pose_world[:3,  3]
+    def world_to_cam_point(M_cam_in_world: np.ndarray) -> np.ndarray:
+        R = M_cam_in_world[:3, :3]
+        T = M_cam_in_world[:3, 3]
 
         R_inv = R.T
         T_inv = -R.T @ T
@@ -147,164 +127,271 @@ class CameraGeometry:
         return M_inv
 
     @staticmethod
-    def pixel_to_cam_ray(cam_info: CameraInfo, img_x: float, img_y: float) -> np.ndarray:
+    def image_pixel_to_cam_coords(cam_info: CameraInfo, u: float, v: float) -> np.ndarray:
         """
-        Converts a pixel (img_x, img_y) into a direction ray in camera space.
-        C++: CameraGeometry::imagePixelToCameraCoords()
-
-        Camera convention: X = forward (optical axis), Y = left, Z = up.
-        focal_length is the X component — it sets the "depth" of the virtual image plane.
-        optical_center offsets map pixel origin (top-left) to camera center.
+        Equivalent to NaoTH: CameraGeometry::imagePixelToCameraCoords()
+        
+        Camera convention: X = forward, Y = left, Z = up.
         """
         x = cam_info.focal_length
-        y = cam_info.optical_center_x - 0.5 - img_x
-        z = cam_info.optical_center_y - 0.5 - img_y
-        return np.array([x, y, z])
+        # NaoTH standard projection corrections:
+        y = cam_info.optical_center_x - u
+        z = cam_info.optical_center_y - v
+        return np.array([x, y, z], dtype=float)
 
     @staticmethod
-    def pixel_to_field(
-        cam_pose_world: np.ndarray,
-        cam_info: CameraInfo,
-        img_x: float,
-        img_y: float,
-        object_height: float = 0.0,
-    ) -> np.ndarray | None:
-        """
-        Projects a pixel back onto the horizontal field plane at a given height above ground.
-        Returns (x, y) in robot/world coordinates, or None if the projection is impossible.
-        C++: CameraGeometry::imagePixelToFieldCoord()  !CHECK!
-
-        Impossible cases (mirrors the C++ epsilon guard):
-          - Ray is horizontal (pixel_vec_world[2] ≈ 0) → never reaches target height
-          - Ray points away from target height (signs differ) → looking above horizon
-            when target is below camera, or vice versa
-        """
-        epsilon = 1e-13
-
-        R = cam_pose_world[:3, :3]   # camera axes in world frame
-        T = cam_pose_world[:3,  3]   # camera position in world (mm)
-
-        # Build the ray direction: pixel → camera space → rotate into world space
-        pixel_vec_cam   = CameraGeometry.pixel_to_cam_ray(cam_info, img_x, img_y)
-        pixel_vec_world = R @ pixel_vec_cam
-
-        # Vertical gap between camera and target plane (negative when camera is above target)
-        height_diff = object_height - T[2]
-
-        # Guard: pixel_vec_world[2] is the ray's vertical component.
-        # The product must be positive: both pointing same direction toward target.
-        if pixel_vec_world[2] * height_diff < epsilon:
-           return None
+    def expected_ball_radius_px(cam_pose: np.ndarray, cam_info: CameraInfo, ball_radius: float, u: float, v: float) -> float:
+        # 1. Ray in camera coordinates
+        ray_cam = CameraGeometry.image_pixel_to_cam_coords(cam_info, u, v)
         
-        # Parameter t: how far along the ray to reach object_height
-        # world_point = cam_pos + t * ray_direction → solve for t from Z component
-        t = height_diff / pixel_vec_world[2]
-
-        field_x = T[0] + t * pixel_vec_world[0]
-        field_y = T[1] + t * pixel_vec_world[1]
-        return np.array([field_x, field_y])
-
-    @staticmethod
-    def expected_ball_radius_px(
-        cam_pose_world: np.ndarray,
-        cam_info: CameraInfo,
-        ball_radius_mm: float,
-        img_x: float,
-        img_y: float,
-    ) -> float:
-        """
-        Estimates the expected ball radius in pixels for a ball seen at pixel (img_x, img_y).
-        Returns -1.0 if the projection is geometrically impossible.
-        C++: CameraGeometry::estimateBallRadiusInPixels()  !CHECK!
-
-        Steps:
-          1. Project pixel to field plane at height = ball_radius_mm,
-             gives horizontal ball position (x, y) on the field
-          2. Reconstruct full 3D ball center: (field_x, field_y, ball_radius_mm)
-             z = ball_radius because ball rests on ground and center is one radius above ground
-          3. Transform ball center into camera space (air distance from lens to ball center)
-          4. Angular diameter to pixel radius
-        """
-        # Step 1: project pixel onto field plane at ball center height
-        point_on_field = CameraGeometry.pixel_to_field(
-            cam_pose_world, cam_info, img_x, img_y, ball_radius_mm
-        )
-
-        if point_on_field is None:
+        R = cam_pose[:3, :3]
+        T = cam_pose[:3, 3]
+        
+        # 2. Ray projected into world coordinates
+        ray_world = R @ ray_cam
+        
+        if ray_world[2] >= -1e-5:
+            return -1.0
+            
+        # 3. Intersection point on ground plane in World Space
+        t = -T[2] / ray_world[2]
+        point_world = T + t * ray_world
+        
+        # 4. Transform point back to Camera Space using inverted pose
+        M_world_to_cam = CameraGeometry.world_to_cam_point(cam_pose)
+        point_world_hom = np.append(point_world, 1.0)
+        point_cam_hom = M_world_to_cam @ point_world_hom
+        
+        # 5. Compute true geometric distance from lens center
+        distance_to_ball = np.linalg.norm(point_cam_hom[:3])
+        
+        if distance_to_ball <= 0:
             return -1.0
 
-        # Step 2: full 3D ball center in world coordinates (homogeneous)
-        ball_center_world = np.array([
-            point_on_field[0],
-            point_on_field[1],
-            ball_radius_mm,     # z = one radius above ground
-            1.0,                # homogeneous coordinate
-        ])
-
-        # Step 3: transform into camera space, get straight-line distance
-        ball_in_cam      = CameraGeometry.world_to_cam(cam_pose_world) @ ball_center_world
-        cam_ball_distance = np.linalg.norm(ball_in_cam[:3])
-
-        # Guard: camera must be outside the ball (distance > radius)
-        # If inside, the tangent-line angular formula below breaks down
-        if cam_ball_distance <= ball_radius_mm:
-            return -1.0
-
-        # Step 4: angular half-diameter → pixels
-        alpha = np.arctan2(ball_radius_mm, cam_ball_distance)
-        return alpha / cam_info.opening_angle_height * cam_info.height
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Color classifier
-# ─────────────────────────────────────────────────────────────────────────────
-
-# class ColorClassifier:
+        return (ball_radius * cam_info.focal_length) / distance_to_ball
+    
+# class CameraGeometry:
 #     """
-#     YCbCr-based colour classifier.  Construct with tuned parameters; call
-#     is_green() on numpy arrays of Y / Cb / Cr channel values.
+#     NaoTH-consistent camera geometry layer.
+
+#     Conventions (aligned with RoboCup NaoTH):
+#     - Camera coordinate system:
+#         X: forward (optical axis)
+#         Y: left
+#         Z: up
+#     - World/robot frame assumed right-handed
 #     """
 
-#     def __init__(
-#         self,
-#         brightness_cone_radius_white: float,
-#         brightness_cone_radius_black: float,
-#         brightness_cone_offset:       float,
-#         color_angle_center:           float,
-#         color_angle_width:            float,
-#     ):
-#         self.bcr_white  = brightness_cone_radius_white
-#         self.bcr_black  = brightness_cone_radius_black
-#         self.bc_offset  = brightness_cone_offset
-#         self.ca_center  = color_angle_center
-#         self.ca_width   = color_angle_width
+#     # ─────────────────────────────────────────────
+#     # Pose handling (NaoTH Pose3D-style)
+#     # ─────────────────────────────────────────────
 
-#     # ── private helpers ───────────────────────────────────────────────────────
+#     # Camera Matrix parsing and inversion
+#     # cpp Serializer<CameraMatrix>
+#     @staticmethod
+#     def parse_into_pose_matrix(rep: dict) -> np.ndarray:
+#         """
+#         Parses the API representation_data into a 4x4 cam-in-world pose matrix.
 
-#     def _is_achromatic(self, y: np.ndarray, u: np.ndarray, v: np.ndarray) -> np.ndarray:
-#         alpha     = (self.bcr_white - self.bcr_black) / (255.0 - self.bc_offset)
-#         threshold = np.clip(
-#             self.bcr_black + alpha * (y - self.bc_offset),
-#             self.bcr_black, 255,
-#         )
-#         return np.hypot(u - 128, v - 128) < threshold
+#         M = [R | T] where:
+#         R  — camera axes expressed in robot/world frame (rows = x, y, z camera axes)
+#         T  — camera position in robot/world frame (mm)
 
-#     def _is_target_hue(self, u: np.ndarray, v: np.ndarray) -> np.ndarray:
-#         angle = np.arctan2(v - 128, u - 128)
-#         diff  = np.arctan2(np.sin(angle - self.ca_center), np.cos(angle - self.ca_center))
-#         return np.abs(diff) < self.ca_width
+#         Usage:
+#         world_point = M @ cam_point     (cam → world)
+#         cam_point   = M_inv @ world_pt  (world → cam, use camera_matrix_to_world_to_cam)
+#         """
+#         pose = rep["pose"]
+#         rot = pose["rotation"]
+#         t   = pose["translation"]
 
-#     # ── public ───────────────────────────────────────────────────────────────
+#         R = np.array([
+#             [rot[0]["x"], rot[0]["y"], rot[0]["z"]],
+#             [rot[1]["x"], rot[1]["y"], rot[1]["z"]],
+#             [rot[2]["x"], rot[2]["y"], rot[2]["z"]],
+#         ], dtype=float)
 
-#     def is_green(self, y: np.ndarray, u: np.ndarray, v: np.ndarray) -> np.ndarray:
-#         return ~self._is_achromatic(y, u, v) & self._is_target_hue(u, v)
+#         T = np.array([t["x"], t["y"], t["z"]], dtype=float)
+
+#         M = np.eye(4)
+#         M[:3, :3] = R
+#         M[:3,  3] = T
+#         return M
+
+#     # cpp Pose3D::invert() for rigid body transform
+#     @staticmethod
+#     def world_to_cam_point(M_cam_in_world: np.ndarray) -> np.ndarray:
+#         """
+#         Inverts a cam-in-world pose into a world-to-camera transform.
+
+#         Since M is a rigid body transform (orthonormal R):
+#         R_inv = R^T
+#         T_inv = -R^T @ T
+#         """
+#         R = M_cam_in_world[:3, :3]
+#         T = M_cam_in_world[:3, 3]
+
+#         R_inv = R.T
+#         T_inv = -R.T @ T
+
+#         M_inv = np.eye(4)
+#         M_inv[:3, :3] = R_inv
+#         M_inv[:3,  3] = T_inv
+        
+#         return M_inv
+
 
 #     @staticmethod
-#     def default_green() -> "ColorClassifier":
-#         return ColorClassifier(50, 3, 40, np.radians(-132.0), np.radians(34.9))
+#     def image_pixel_to_cam_cords(cam_info: CameraInfo, u: float, v: float) -> np.ndarray:
+#         """
+#         Equivalent to NaoTH:
+#         CameraGeometry::imagePixelToCameraCoords()
+
+#         Converts a pixel (img_x, img_y) into a direction ray in camera space.
+
+#         Camera convention: X = forward (optical axis), Y = left, Z = up.
+#         focal_length is the X component — it sets the "depth" of the virtual image plane.
+#         optical_center offsets map pixel origin (top-left) to camera center.
+#         """
+#         x = cam_info.focal_length
+#         y = (cam_info.optical_center_x - u)
+#         z = (cam_info.optical_center_y - v)
+#         return np.array([x, y, z], dtype=float)
+
+#     # ─────────────────────────────────────────────
+#     # Pixel field intersection
+#     # ─────────────────────────────────────────────
+
+#     @staticmethod
+#     def pixel_to_field(
+#         cam_pose_world: np.ndarray,
+#         cam_info: CameraInfo,
+#         u: float,
+#         v: float,
+#         plane_z: float = 0.0,
+#     ) -> np.ndarray | None:
+#         """
+#         Projects a pixel back onto the horizontal field plane at a given height above ground.
+#         Returns (x, y) in robot/world coordinates, or None if the projection is impossible.
+
+#         Impossible cases (mirrors the C++ epsilon guard):
+#         - Ray is horizontal (pixel_vec_world[2] ≈ 0) → never reaches target height
+#         - Ray points away from target height (signs differ) → looking above horizon
+#             when target is below camera, or vice versa
+#         """
+#         epsilon = 1e-13
+
+#         R = cam_pose_world[:3, :3]   # camera axes in world frame
+#         T = cam_pose_world[:3,  3]   # camera position in world (mm)
+
+#         # Build the ray direction: pixel → camera space → rotate into world space
+#         pixel_vec_cam   = CameraGeometry.image_pixel_to_cam_cords(cam_info, u, v)
+#         pixel_vec_world = R @ pixel_vec_cam
+
+#         # Vertical gap between camera and target plane (negative when camera is above target)
+#         height_diff = plane_z - T[2]
+
+#         # Guard: pixel_vec_world[2] is the ray's vertical component.
+#         # The product must be positive: both pointing same direction toward target.
+#         if pixel_vec_world[2] * height_diff < epsilon:
+#             return None
+
+#         # Parameter t: how far along the ray to reach object_height
+#         # world_point = cam_pos + t * ray_direction → solve for t from Z component
+#         t = height_diff / pixel_vec_world[2]
+
+#         field_x = T[0] + t * pixel_vec_world[0]
+#         field_y = T[1] + t * pixel_vec_world[1]
+#         return np.array([field_x, field_y])
+
+#     #CameraGeometry.cpp CameraGeometry::imagePixelToFieldCoord() 
+#     @staticmethod
+#     def image_pixel_to_field_coord(
+#         cam_pose_world: np.ndarray,
+#         cam_info: CameraInfo,
+#         img_x: float,
+#         img_y: float,
+#         object_height: float,
+#     ) -> np.ndarray | None:
+#         """
+#         Projects a pixel back onto the horizontal field plane at a given height above ground.
+#         Returns (x, y) in robot/world coordinates, or None if the projection is impossible.
+
+#         Impossible cases (mirrors the C++ epsilon guard):
+#         - Ray is horizontal (pixel_vec_world[2] ≈ 0) → never reaches target height
+#         - Ray points away from target height (signs differ) → looking above horizon
+#             when target is below camera, or vice versa
+#         """
+#         epsilon = 1e-13
+
+#         R = cam_pose_world[:3, :3]   # camera axes in world frame
+#         T = cam_pose_world[:3,  3]   # camera position in world (mm)
+
+#         # Build the ray direction: pixel → camera space → rotate into world space
+#         pixel_vec_cam   = CameraGeometry.image_pixel_to_cam_cords(cam_info, img_x, img_y)
+#         pixel_vec_world = R @ pixel_vec_cam
+
+#         # Vertical gap between camera and target plane (negative when camera is above target)
+#         height_diff = object_height - T[2]
+
+#         # Guard: pixel_vec_world[2] is the ray's vertical component.
+#         # The product must be positive: both pointing same direction toward target.
+#         if pixel_vec_world[2] * height_diff < epsilon:
+#             return None
+
+#         # Parameter t: how far along the ray to reach object_height
+#         # world_point = cam_pos + t * ray_direction → solve for t from Z component
+#         t = height_diff / pixel_vec_world[2]
+
+#         field_x = T[0] + t * pixel_vec_world[0]
+#         field_y = T[1] + t * pixel_vec_world[1]
+#         return np.array([field_x, field_y])
+
+#     # ─────────────────────────────────────────────
+#     # Ball radius estimation (NaoTH-consistent)
+#     # ─────────────────────────────────────────────
+
+#     #CameraGeometry.cpp estimateBallRadiusInPixels() !CHECK!
+#     @staticmethod
+#     def expected_ball_radius_px(cam_pose, cam_info, ball_radius, u, v):
+#         # 1. Get ray direction in camera space
+#         ray_cam = CameraGeometry.image_pixel_to_cam_cords(u, v, cam_info)
+        
+#         # 2. Rotate the ray into world coordinates using the Camera Matrix's rotation
+#         # In NaoTH, cam_pose.R converts vectors from Camera-space to World-space
+#         ray_world = cam_pose.R @ ray_cam
+        
+#         # 3. Get the camera's height above the ground surface
+#         cam_z = cam_pose.translation[2]
+        
+#         # CRITICAL SECURITY CHECK: 
+#         # Since the camera is above ground (cam_z > 0), the ray MUST point DOWNWARD (ray_world[2] < 0)
+#         # If ray_world[2] is >= 0, the ray points into space/sky and will never hit the grass.
+#         if ray_world[2] >= -1e-5:
+#             return -1.0  # This causes your "Hard geometric failure" loop if signs are flipped
+            
+#         # 4. Calculate intersection distance parameter (t) along the line vector
+#         t = -cam_z / ray_world[2]
+        
+#         # 5. Project the target position in camera coordinates
+#         # This matches NaoTH's distance scaling method
+#         ball_pos_cam = ray_cam * t
+#         distance_to_ball = np.linalg.norm(ball_pos_cam)
+        
+#         if distance_to_ball <= 0:
+#             return -1.0
+
+#         # 6. Thales's intercept theorem back into pixel space radius size
+#         expected_r = (ball_radius * cam_info.focal_length) / distance_to_ball
+#         return expected_r
+
 
 def angle_diff(a, b):
     return np.arctan2(np.sin(a - b), np.cos(a - b))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Color classification
+# ─────────────────────────────────────────────────────────────────────────────
 class ColorClassifier:
     def __init__(self, bW, bB, bO, cC, cW):
         self.brightnessConeRadiusWhite = bW
@@ -357,7 +444,6 @@ class ColorClassifier:
 # ─────────────────────────────────────────────────────────────────────────────
 # Annotation parser
 # ─────────────────────────────────────────────────────────────────────────────
-
 class AnnotationParser:
     """Parse Label Studio annotations (single item per call)."""
 
@@ -413,11 +499,9 @@ class AnnotationParser:
 
         return [[(float(x), float(y)) for x, y in pts]]
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Mask builder
-# ─────────────────────────────────────────────────────────────────────────────
-
+# ────────────────────────────────────────────────────────────────────────────
 class MaskBuilder:
     """Convert annotation geometry to boolean pixel masks."""
 
@@ -458,11 +542,9 @@ class MaskBuilder:
 
         return np.array(canvas) > 0
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Ball detector
 # ─────────────────────────────────────────────────────────────────────────────
-
 @dataclass
 class DetectionResult:
     candidates:   list[tuple[int, int, int, int]]   # (x, y, w, h) in image coords
@@ -478,7 +560,6 @@ class DetectionResult:
     roi:            tuple[int, int, int, int] | None = None
     raw_candidates: list[tuple[int, int, int, int]] | None = None
     row_radius:     dict[int, float] | None = None
-
 
 class BallDetector:
     """
@@ -531,20 +612,43 @@ class BallDetector:
         x0, x1, y0, y1 = roi
 
         # Step 3 — expected radius per row (in full-image coords)
-        cx_full    = x0 + (x1 - x0) // 2
+        # cx_full    = x0 + (x1 - x0) // 2
+        # row_radius = {
+        #     y: CameraGeometry.expected_ball_radius_px(
+        #         self.cam_pose, self.cam_info, self.ball_r, cx_full, y
+        #     )
+        #     for y in range(y0, y1)
+        # }
+        # ROI
+        roi = self._roi_from_mask(field_border_mask, w, h)
+        x0, x1, y0, y1 = roi
+
+        cx = (x0 + x1) // 2
+
         row_radius = {
             y: CameraGeometry.expected_ball_radius_px(
-                self.cam_pose, self.cam_info, self.ball_r, cx_full, y
+                self.cam_pose, self.cam_info, self.ball_r, cx, y
             )
             for y in range(y0, y1)
         }
 
-        # Step 4 — adaptive scanlines (full-image coords, inside ROI)
-        field_top_y = self._first_green_row(valid_field_mask[y0:y1, x0:x1], y0)
-        
-        scanlines_h = self._hlines(valid_field_mask, field_border_mask, row_radius, field_top_y, y0, y1, x0, x1)
-        scanlines_v = self._vlines(valid_field_mask, field_border_mask, row_radius, field_top_y, y0, y1, x0, x1)
+        # scanlines
+        field_top_y = y0
 
+        scanlines_h = self._hlines(
+            field_border_mask, field_top_y, y0, y1, x0, x1
+        )
+
+        scanlines_v = self._vlines(
+            green_mask, field_border_mask, row_radius,
+            field_top_y, y0, y1, x0, x1
+        )
+        # Step 4 — adaptive scanlines (full-image coords, inside ROI)
+        # field_top_y = self._first_green_row(valid_field_mask[y0:y1, x0:x1], y0)
+        
+        # scanlines_h = self._hlines(valid_field_mask, field_border_mask, y0, y1, x0, x1)
+        # scanlines_v = self._vlines(valid_field_mask, field_border_mask, row_radius, field_top_y, y0, y1, x0, x1)
+        
         # Step 5 — gap scan + clustering
         radius_values = [v for v in row_radius.values() if v > 0]
         r_far   = max(row_radius.get(scanlines_h[0]  if scanlines_h else y0,  5.0), 3.0)
@@ -556,7 +660,7 @@ class BallDetector:
 
         raw_candidates, gap_segments = self._scan_and_cluster(
             valid_field_mask, scanlines_h, scanlines_v,
-            min_gap, max_gap, field_top_y, cluster_proximity,
+            min_gap, max_gap, field_top_y, cluster_proximity, fb_mask=field_border_mask,
         )
 
         # Step 6 — filter by expected radius; optionally split wide boxes
@@ -595,24 +699,75 @@ class BallDetector:
                 return y0 + i
         return y0
 
-    def _hlines(self, valid_field_mask, fb_mask, row_radius, field_top, y0, y1, x0, x1):
-        lines = []
-        y = field_top
-        last_valid_r = 10.0
-        while y < y1:
-            row_slice = fb_mask[y, x0:x1] if fb_mask is not None else None
-            if row_slice is None or row_slice.mean() > 0.05:
-                lines.append(y)
-            r    = row_radius.get(y, -1.0)
+    # def _hlines(self, valid_field_mask, fb_mask, row_radius, field_top, y0, y1, x0, x1):
+    #     lines = []
+    #     y = field_top
+    #     last_valid_r = 10.0
+    #     while y < y1:
+    #         row_slice = fb_mask[y, x0:x1] if fb_mask is not None else None
+    #         if row_slice is None or row_slice.mean() > 0.05:
+    #             lines.append(y)
+    #         r    = row_radius.get(y, -1.0)
             
-            if r <= 0:
-                r = last_valid_r
-            else:
-                last_valid_r = r
+    #         if r <= 0:
+    #             r = last_valid_r
+    #         else:
+    #             last_valid_r = r
 
-            step = max(2, int(self.step * 2 * r))
+    #         step = max(2, int(self.step * 2 * r))
+    #         y += step
+    #     return lines
+
+    def _hlines(
+        self,
+        fb_mask,
+        field_top,
+        y0,
+        y1,
+        x0,
+        x1,
+    ):
+        lines = []
+
+        y = field_top
+
+        while y < y1:
+
+            # field intersection test
+            if fb_mask is not None:
+                row = fb_mask[y, x0:x1]
+
+                if row.size > 0 and not row.any():
+                    y += 2
+                    continue
+
+            lines.append(y)
+
+            # estimate projected ball radius locally
+            x_mid = (x0 + x1) // 2
+
+            r = CameraGeometry.expected_ball_radius_px(
+                self.cam_pose,
+                self.cam_info,
+                self.ball_r,
+                x_mid,
+                y,
+            )
+
+            if r <= 0 or np.isnan(r):
+                r = 4.0
+
+            # NaoTH-style:
+            # spacing proportional to diameter
+            step = int(max(2, r))
+
+            # mild stabilization only
+            step = min(step, 12)
+
             y += step
+
         return lines
+    
 
     # def _vlines(self, valid_field_mask, fb_mask, row_radius, field_top, y0, y1, x0, x1):
     #     lines           = []
@@ -665,7 +820,7 @@ class BallDetector:
 
     def _scan_and_cluster(
         self, valid_field_mask, scanlines_h, scanlines_v,
-        min_gap, max_gap, field_top, proximity,
+        min_gap, max_gap, field_top, proximity,fb_mask,
     ) -> tuple[list, list]:
         h, w     = valid_field_mask.shape[:2]
         segments = []
@@ -676,7 +831,15 @@ class BallDetector:
             if y >= h:
                 continue
             in_gap, start_x = False, 0
-            for x in range(w):
+            valid_x = np.where(fb_mask[y])[0]
+
+            if len(valid_x) == 0:
+                continue
+
+            xmin = valid_x.min()
+            xmax = valid_x.max()
+            
+            for x in range(xmin, xmax + 1):
                 green = valid_field_mask[y, x]
                 if not green and not in_gap:
                     start_x, in_gap = x, True
@@ -780,7 +943,62 @@ class BallDetector:
 
         return False
 
+
     def _filter(
+        self, 
+        raw_candidates: list[tuple[int, int, int, int]], 
+        fb_mask: np.ndarray | None, 
+        row_radius: dict[int, float]
+    ) -> list[tuple[int, int, int, int]]:
+        filtered_candidates = []
+
+        for idx, (x, y, w, h) in enumerate(raw_candidates):
+            cx = x + w // 2
+            cy = y + h // 2
+
+            # Try reading from row pre-computations
+            expected_r = row_radius.get(cy, -1.0)
+            
+            # Recalculate if cache is invalid
+            if expected_r <= 0 or np.isnan(expected_r):
+                expected_r = CameraGeometry.expected_ball_radius_px(
+                    self.cam_pose, self.cam_info, self.ball_r, cx, cy
+                )
+
+            # If geometry checks fail, fall back gracefully for distant horizons
+            if expected_r <= 0 or np.isnan(expected_r):
+                if 4 <= w <= 30 and 4 <= h <= 30:
+                    aspect_ratio = max(w, h) / min(w, h)
+                    if aspect_ratio <= 1.8:
+                        filtered_candidates.append((x, y, w, h))
+                        continue
+                continue
+
+            expected_diameter = expected_r * 2.0
+            size_ratio_w = w / expected_diameter
+            size_ratio_h = h / expected_diameter
+
+            # NaoTH dynamic scale checks
+            # Close foreground clusters can expand significantly due to blooming
+            if cy > 380:
+                min_ratio, max_ratio = 0.35, 3.20
+                max_aspect = 2.5
+            else:
+                min_ratio, max_ratio = 0.45, 1.75
+                max_aspect = 1.8
+
+            # Add this temporary print inside your _filter loop:
+            if w > 40: # Only look at big clusters like the foreground ball
+                print(f"Candidate at ({cx},{cy}): w={w}, h={h}, expected_diam={expected_diameter:.1f}, ratio_w={size_ratio_w:.2f}, ratio_h={size_ratio_h:.2f}")
+
+            if (min_ratio <= size_ratio_w <= max_ratio) and (min_ratio <= size_ratio_h <= max_ratio):
+                aspect_ratio = max(w, h) / min(w, h)
+                if aspect_ratio <= max_aspect:
+                    filtered_candidates.append((x, y, w, h))
+
+        return filtered_candidates
+
+    def _filter_old(
         self,
         raw: list[tuple],
         field_border_mask: np.ndarray | None,
@@ -800,6 +1018,7 @@ class BallDetector:
             r_exp = CameraGeometry.expected_ball_radius_px(
                 self.cam_pose, self.cam_info, self.ball_r, cx, cy
             )
+            
             if r_exp <= 0:
                 continue
 
@@ -812,16 +1031,30 @@ class BallDetector:
                 else [(x, y, w, h)]
             )
             for hx, hy, hw, hh in halves:
-                r_patch = (hw + hh) / 4.0
+                # r_patch = (hw + hh) / 4.0
+                # if lo <= r_patch <= hi:
+                #     filtered.append((hx, hy, hw, hh))
+                cx = hx + hw // 2
+                cy = hy + hh // 2
+
+                r_patch = CameraGeometry.expected_ball_radius_px(
+                    self.cam_pose,
+                    self.cam_info,
+                    self.ball_r,
+                    cx,
+                    cy
+                )
+
+                if r_patch <= 0:
+                    continue
+
                 if lo <= r_patch <= hi:
                     filtered.append((hx, hy, hw, hh))
         return filtered
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Match checker
 # ─────────────────────────────────────────────────────────────────────────────
-
 def check_annotation_match(
     candidates:      list[tuple],
     ball_annotation: tuple[float, float] | None,
@@ -886,7 +1119,6 @@ def plot_mask(mask):
     plt.imshow(mask, cmap="gray", interpolation="nearest")
     plt.axis("off")
     plt.show()
-
 
 class Visualizer:
 
@@ -1019,11 +1251,9 @@ def load_image_ycbcr(path: Path):
 
     return rgb, img_y, img_u, img_v
 
-
 def load_annotation(path: Path) -> dict:
     with open(path) as f:
         return json.load(f)
-
 
 def scan_folder(folder: Path, image_ext: str = ".jpg") -> list[dict]:
     """
@@ -1079,7 +1309,7 @@ class FrameProcessor:
         items = list(islice(cm_iter, 1))
         if not items:
             return None
-        return CameraGeometry.parse_pose_matrix(items[0].representation_data)
+        return CameraGeometry.parse_into_pose_matrix(items[0].representation_data)
 
     def process(self, entry: dict) -> bool:
         stem     = entry["stem"]
